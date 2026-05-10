@@ -8,7 +8,7 @@ run_realtime_inference.py — 真机实时推理客户端（仅头部相机版�
 2. 仅使用头部摄像头图像进行推理
 3. 按键触发推理，使用最新观测数据
 4. 发送动作到机器人端执行
-
+ 
 使用方式：
     cd /home/dmh/xyj_zhipingfang/model3_openpi0.5/my_bot2_deployment/offline_inference
     source /home/dmh/xyj_zhipingfang/model3_openpi0.5/openpi/.venv/bin/activate
