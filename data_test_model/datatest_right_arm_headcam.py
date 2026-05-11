@@ -4,7 +4,7 @@
 # OpenPI 右臂8维离线推理脚本
 # ════════════════════════════════════════════════════════════════
 """
-功能： 
+功能：
 1. 仅从数据集读取头部相机图像（cam_high）
 2. 从 parquet 文件读取右臂8维关节状态和动作
 3. 使用 OpenPI 右臂8维模型进行推理
@@ -49,9 +49,8 @@ from typing import Optional
 # 【关键】设置 Python 路径
 # ════════════════════════════════════════════════════════════════
 _SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
-_OPENPI_ROOT = _SCRIPT_DIR.parent.parent / "openpi"
+_OPENPI_ROOT = _SCRIPT_DIR.parent.parent / "openpi-main"
 sys.path.insert(0, str(_OPENPI_ROOT / "src"))
-
 # 设置 OPENPI_DATA_HOME
 if "OPENPI_DATA_HOME" not in os.environ:
     os.environ["OPENPI_DATA_HOME"] = str(_OPENPI_ROOT / ".openpi_cache")
@@ -87,6 +86,7 @@ CAMERA_KEYS = {
 }
 
 DEFAULT_PROMPT = "right arm pick and place task"
+DEFAULT_EVAL_HORIZON = 50
 
 JOINT_NAMES_8D = [
     "right_joint_0", "right_joint_1", "right_joint_2",
@@ -219,7 +219,7 @@ def build_policy(
     # 使用仅头部相机的输入转换
     transforms = [
         RightArmHeadcamInputs(),
-        _transforms.Normalize(norm_stats, use_quantiles=True),
+        _transforms.Normalize(norm_stats, use_quantiles=False),
         PadStateTo32(),
         _transforms.ResizeImages(224, 224),
         _transforms.TokenizePrompt(
@@ -230,7 +230,7 @@ def build_policy(
     delta_mask = _transforms.make_bool_mask(7, -1)
 
     output_transforms = [
-        _transforms.Unnormalize(norm_stats, use_quantiles=True),
+        _transforms.Unnormalize(norm_stats, use_quantiles=False),
         _transforms.AbsoluteActions(delta_mask),
         RightArmOutputs(),
     ]
@@ -318,6 +318,28 @@ class ParquetReader:
         action = self.action_data[frame_index]
         return np.asarray(action[:8], dtype=np.float32)
 
+    def get_action_sequence(self, frame_index: int, horizon: int) -> tuple[np.ndarray, int]:
+        """Return future action targets starting at frame_index.
+
+        The model predicts an action chunk of length `horizon`. Near the end of
+        an episode, fewer than `horizon` ground-truth actions exist; in that case
+        the returned sequence is padded with the last valid action, and
+        `valid_horizon` tells callers how many steps should be included in metrics.
+        """
+        if frame_index >= self.nrows:
+            raise IndexError(f"frame_index {frame_index} out of range for {self.nrows} rows")
+
+        end = min(self.nrows, frame_index + horizon)
+        actions = [self.get_action(i) for i in range(frame_index, end)]
+        valid_horizon = len(actions)
+        if valid_horizon == 0:
+            raise RuntimeError(f"no actions available from frame {frame_index}")
+
+        while len(actions) < horizon:
+            actions.append(actions[-1].copy())
+
+        return np.stack(actions, axis=0), valid_horizon
+
     def get_frame_info(self, frame_index: int) -> dict:
         return {
             "episode_index": self.table.column("episode_index")[frame_index].as_py(),
@@ -332,16 +354,24 @@ class ParquetReader:
 # 工具函数
 # ════════════════════════════════════════════════════════════════
 
-def format_angle(val_deg: float) -> str:
-    """格式化角度值，带符号"""
-    sign = "+" if val_deg >= 0 else ""
-    return f"{sign}{val_deg:.2f}°"
+def to_display_units(values: np.ndarray) -> np.ndarray:
+    """Convert joint radians to degrees while keeping gripper in raw units."""
+    out = np.asarray(values, dtype=np.float32).copy()
+    out[..., :7] = out[..., :7] * 180 / math.pi
+    return out
+
+
+def format_display_value(value: float, dim: int) -> str:
+    """Format joints as degrees and gripper as raw opening value."""
+    sign = "+" if value >= 0 else ""
+    suffix = "" if dim == 7 else "°"
+    return f"{sign}{value:.4f}{suffix}"
 
 
 def print_frame_summary(
     frame_idx: int, total_frames: int,
-    state_deg: np.ndarray, model_output_deg: np.ndarray,
-    action_deg: np.ndarray, error_deg: np.ndarray,
+    state_display: np.ndarray, model_output_display: np.ndarray,
+    action_display: np.ndarray, error_display: np.ndarray,
 ):
     """打印简洁的帧摘要表格"""
     import sys
@@ -354,7 +384,7 @@ def print_frame_summary(
 
     # 数据行
     for i, name in enumerate(JOINT_NAMES_8D):
-        print(f"│ {name:<21} │ {format_angle(state_deg[i]):>14} │ {format_angle(model_output_deg[i]):>14} │ {format_angle(action_deg[i]):>14} │ {format_angle(error_deg[i]):>14} │")
+        print(f"│ {name:<21} │ {format_display_value(state_display[i], i):>14} │ {format_display_value(model_output_display[i], i):>14} │ {format_display_value(action_display[i], i):>14} │ {format_display_value(error_display[i], i):>14} │")
 
     # 底部横线
     if frame_idx == total_frames - 1:
@@ -371,6 +401,7 @@ def run_inference(
     dataset_dir: pathlib.Path,
     episode_index: int,
     device: str,
+    eval_horizon: int = DEFAULT_EVAL_HORIZON,
     save_frames: bool = True,
     max_frames: Optional[int] = None,
     fixed_noise_seed: Optional[int] = None,
@@ -389,6 +420,7 @@ def run_inference(
     print(f"数据集: {dataset_dir}")
     print(f"Episode: {episode_index}")
     print(f"设备: {device}")
+    print(f"评估 horizon: {eval_horizon}")
     print("相机配置: 仅使用 cam_high (头部相机)")
     print("=" * 70)
 
@@ -428,7 +460,7 @@ def run_inference(
         print(f"  Parquet: {parquet_path} ({len(parquet_reader)} 条记录)")
 
     # 获取总帧数
-    total_frames = min(len(ext) for ext in extractors.values())
+    total_frames = min(min(len(ext) for ext in extractors.values()), len(parquet_reader))
     if max_frames is not None:
         total_frames = min(total_frames, max_frames)
 
@@ -452,7 +484,8 @@ def run_inference(
 
     total_inference_time = 0.0
     all_results = []
-    total_mae = 0.0
+    total_abs_error = 0.0
+    total_error_values = 0
     per_joint_errors = {name: [] for name in JOINT_NAMES_8D}
 
     for frame_idx in range(total_frames):
@@ -469,7 +502,7 @@ def run_inference(
         # 读取关节状态和目标动作
         frame_info = parquet_reader.get_frame_info(frame_idx)
         state_full = frame_info["state"]
-        action_gt = frame_info["action"]
+        action_gt_seq, valid_horizon = parquet_reader.get_action_sequence(frame_idx, eval_horizon)
 
         # 构造模型输入 - 仅头部相机
         obs = {
@@ -486,29 +519,39 @@ def run_inference(
         inference_time = time.time() - t_infer_start
         total_inference_time += inference_time
 
-        # 模型输出经过 Unnormalize + AbsoluteActions 后直接就是绝对位置
-        # 无需再做 state + delta 的叠加（AbsoluteActions 已处理）
-        model_output_rad = result["actions"][0]
+        # 模型输出经过 Unnormalize + AbsoluteActions 后是绝对位置 action chunk。
+        # 这里评估完整 horizon，而不是只评估第 0 步。
+        model_output_seq_rad = np.asarray(result["actions"][:eval_horizon], dtype=np.float32)
+        compare_horizon = min(valid_horizon, model_output_seq_rad.shape[0])
+        model_output_valid_rad = model_output_seq_rad[:compare_horizon]
+        action_gt_valid = action_gt_seq[:compare_horizon]
+        error_seq_rad = model_output_valid_rad - action_gt_valid
+        frame_mae = float(np.mean(np.abs(error_seq_rad)))
 
-        # 计算误差：模型输出（绝对位置） vs 目标动作
-        error_rad = model_output_rad - action_gt
-        frame_mae = np.mean(np.abs(error_rad))
-
-        total_mae += frame_mae
+        total_abs_error += float(np.sum(np.abs(error_seq_rad)))
+        total_error_values += int(error_seq_rad.size)
 
         # 记录每个关节的误差
         for i, name in enumerate(JOINT_NAMES_8D):
-            per_joint_errors[name].append(abs(error_rad[i]))
+            per_joint_errors[name].extend(np.abs(error_seq_rad[:, i]).tolist())
 
-        # 转换为角度
-        state_deg = state_full * 180 / math.pi
-        model_output_deg = model_output_rad * 180 / math.pi
-        action_deg = action_gt * 180 / math.pi
-        error_deg = error_rad * 180 / math.pi
+        # 控制台摘要只展示 horizon 第 0 步；CSV/JSON 会保存完整 horizon。
+        model_output_rad = model_output_valid_rad[0]
+        action_gt = action_gt_valid[0]
+        error_rad = error_seq_rad[0]
+
+        # 前 7 维关节转角度；第 8 维 gripper 保持原始开合值。
+        state_display = to_display_units(state_full)
+        model_output_display = to_display_units(model_output_rad)
+        action_display = to_display_units(action_gt)
+        error_display = to_display_units(error_rad)
+        model_output_horizon_display = to_display_units(model_output_valid_rad)
+        action_target_horizon_display = to_display_units(action_gt_valid)
+        error_horizon_display = to_display_units(error_seq_rad)
 
         print_frame_summary(
             frame_idx, total_frames,
-            state_deg, model_output_deg, action_deg, error_deg
+            state_display, model_output_display, action_display, error_display
         )
 
         # 保存结果
@@ -516,25 +559,35 @@ def run_inference(
             "frame_index": frame_idx,
             "timestamp": frame_info["timestamp"],
             "episode_index": frame_info["episode_index"],
+            "eval_horizon": int(eval_horizon),
+            "valid_horizon": int(compare_horizon),
             # 当前输入状态
             "state_input_rad": [float(x) for x in state_full.tolist()],
-            "state_input_deg": [float(x) for x in (state_full * 180 / math.pi).tolist()],
-            # 模型输出（绝对角度）
+            "state_input_display": [float(x) for x in state_display.tolist()],
+            # horizon 第 0 步，保留旧字段便于快速查看
             "model_output_rad": [float(x) for x in model_output_rad.tolist()],
-            "model_output_deg": [float(x) for x in model_output_deg.tolist()],
-            # 目标动作
+            "model_output_display": [float(x) for x in model_output_display.tolist()],
             "action_target_rad": [float(x) for x in action_gt.tolist()],
-            "action_target_deg": [float(x) for x in action_deg.tolist()],
-            # 预测误差
+            "action_target_display": [float(x) for x in action_display.tolist()],
             "error_rad": [float(x) for x in error_rad.tolist()],
-            "error_deg": [float(x) for x in error_deg.tolist()],
-            "mae_deg": float(frame_mae * 180 / math.pi),
+            "error_display": [float(x) for x in error_display.tolist()],
+            # 完整 horizon 结果
+            "model_output_horizon_rad": model_output_valid_rad.astype(float).tolist(),
+            "model_output_horizon_display": model_output_horizon_display.astype(float).tolist(),
+            "action_target_horizon_rad": action_gt_valid.astype(float).tolist(),
+            "action_target_horizon_display": action_target_horizon_display.astype(float).tolist(),
+            "error_horizon_rad": error_seq_rad.astype(float).tolist(),
+            "error_horizon_display": error_horizon_display.astype(float).tolist(),
+            "mae_horizon_rad_or_raw": float(frame_mae),
             "inference_time_ms": float(inference_time * 1000),
         })
 
     # 计算平均误差
-    avg_mae = total_mae / total_frames
-    per_joint_mae = {name: np.mean(errors) * 180 / math.pi for name, errors in per_joint_errors.items()}
+    avg_mae = total_abs_error / max(1, total_error_values)
+    per_joint_mae = {
+        name: (np.mean(errors) * 180 / math.pi if i < 7 else np.mean(errors))
+        for i, (name, errors) in enumerate(per_joint_errors.items())
+    }
 
     # 8. 保存结果到 CSV
     if output_csv:
@@ -545,22 +598,27 @@ def run_inference(
             writer = csv.writer(f)
 
             # 写入表头
-            header = ["帧索引", "关节名称", "输入角度", "模型输出", "目标角度", "预测误差"]
+            header = ["帧索引", "Horizon步", "有效Horizon", "关节名称", "单位", "输入值", "模型输出", "目标值", "预测误差"]
             writer.writerow(header)
 
-            # 写入数据行 (每帧8行，每行一个关节)
+            # 写入数据行 (每帧 valid_horizon * 8 行)
             for r in all_results:
                 frame_idx = r["frame_index"]
-                for i, name in enumerate(JOINT_NAMES_8D):
-                    row = [
-                        frame_idx,
-                        name,
-                        f"{r['state_input_deg'][i]:.2f}",
-                        f"{r['model_output_deg'][i]:.2f}",
-                        f"{r['action_target_deg'][i]:.2f}",
-                        f"{r['error_deg'][i]:.2f}",
-                    ]
-                    writer.writerow(row)
+                valid_horizon = r["valid_horizon"]
+                for h in range(valid_horizon):
+                    for i, name in enumerate(JOINT_NAMES_8D):
+                        row = [
+                            frame_idx,
+                            h,
+                            valid_horizon,
+                            name,
+                            "raw" if i == 7 else "deg",
+                            f"{r['state_input_display'][i]:.4f}",
+                            f"{r['model_output_horizon_display'][h][i]:.4f}",
+                            f"{r['action_target_horizon_display'][h][i]:.4f}",
+                            f"{r['error_horizon_display'][h][i]:.4f}",
+                        ]
+                        writer.writerow(row)
 
         if verbose:
             print(f"\n结果已保存到 CSV: {csv_path}")
@@ -573,8 +631,11 @@ def run_inference(
             print(f"完整结果已保存到 JSON: {json_path}")
 
     # 计算MAE
-    mae = total_mae / total_frames
-    per_joint_mae = {name: np.mean(errors) * 180 / math.pi for name, errors in per_joint_errors.items()}
+    mae = avg_mae
+    per_joint_mae = {
+        name: (np.mean(errors) * 180 / math.pi if i < 7 else np.mean(errors))
+        for i, (name, errors) in enumerate(per_joint_errors.items())
+    }
 
     # 9. 总结
     t_total = time.time() - t_start_total
@@ -590,9 +651,16 @@ def run_inference(
         print(f"总耗时: {t_total:.2f} 秒")
         print()
         print("【误差统计】")
-        print(f"  平均 MAE: {mae * 180 / math.pi:.4f}°")
+        joint_mae_deg = [
+            np.mean(per_joint_errors[name]) * 180 / math.pi
+            for name in JOINT_NAMES_8D[:7]
+            if len(per_joint_errors[name]) > 0
+        ]
+        print(f"  关节平均 MAE: {np.mean(joint_mae_deg):.4f}°")
+        print(f"  gripper MAE: {per_joint_mae['right_dexterous_hand']:.4f} raw")
         for i, name in enumerate(JOINT_NAMES_8D):
-            print(f"  {name}: {per_joint_mae[name]:.4f}°")
+            unit = "raw" if i == 7 else "°"
+            print(f"  {name}: {per_joint_mae[name]:.4f}{unit}")
 
         if save_frames:
             print(f"\n图像保存目录: {frames_save_dir}")
@@ -667,6 +735,12 @@ def main():
         help="最多处理帧数（默认: 全部）"
     )
     parser.add_argument(
+        "--eval-horizon",
+        type=int,
+        default=DEFAULT_EVAL_HORIZON,
+        help=f"评估模型输出 action chunk 的前 N 步（默认: {DEFAULT_EVAL_HORIZON}）"
+    )
+    parser.add_argument(
         "--fixed-noise-seed",
         type=int,
         default=None,
@@ -722,6 +796,7 @@ def main():
         dataset_dir=dataset_dir,
         episode_index=args.episode_index,
         device=args.device,
+        eval_horizon=args.eval_horizon,
         save_frames=not args.no_save_frames,
         max_frames=args.max_frames,
         fixed_noise_seed=args.fixed_noise_seed,
