@@ -160,7 +160,8 @@ def main(
     """Compute normalization statistics fully offline from local dataset."""
     _apply_offline_patches()
     model_config = pi0_config.Pi0Config(
-        pi05=True,
+        # Keep this aligned with my_config_right_arm_head_cam.py and pi0_base weights.
+        pi05=False,
         action_dim=action_dim,
         action_horizon=action_horizon,
         discrete_state_input=False,

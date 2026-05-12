@@ -1,29 +1,38 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# ════════════════════════════════════════════════════════════════
+# OpenPI 右臂8维真机实时推理脚本
+# ════════════════════════════════════════════════════════════════
 """
-run_realtime_inference.py — 真机实时推理客户端（仅头部相机版）
-
 功能：
-1. TCP服务器模式，接收机器人端发送的实时观测数据
-2. 仅使用头部摄像头图像进行推理
-3. 按键触发推理，使用最新观测数据
-4. 发送动作到机器人端执行
- 
+1. TCP服务器接收机器人端观测数据
+2. 仅使用头部相机图像进行推理
+3. 推理完成后打印并下发50步动作序列给机器人端执行
+4. 支持自定义动作处理器（ActionHandler）扩展
+5. 自动保存每次推理的输入图片和动作数据
+
+保存文件：
+    {save_dir}/
+        infer0001_input_image.jpg    # 输入图片
+        infer0001_actions.json       # 动作数据
+        infer0002_input_image.jpg
+        infer0002_actions.json
+        ...
+
 使用方式：
-    cd /home/dmh/xyj_zhipingfang/model3_openpi0.5/my_bot2_deployment/offline_inference
-    source /home/dmh/xyj_zhipingfang/model3_openpi0.5/openpi/.venv/bin/activate
-    python run_realtime_inference.py \
-        --checkpoint-dir /home/dmh/xyj_zhipingfang/model3_openpi0.5/pi0_checkpoint_xin129tiao_headcam/30000 \
-        --robot-host 192.168.1.100 \
-        --listen-port 9000
+cd /home/dmh/xyj_zhipingfang/model3_openpi0.5/my_bot2_deployment/4090deployment
+/home/dmh/xyj_zhipingfang/model3_openpi0.5/openpi-main/.venv/bin/python robot_right_arm_headcam.py \
+  --checkpoint-dir /home/dmh/xyj_zhipingfang/model3_openpi0.5/checkpoints/pi0_checkpoint_xin128tiao_headcam/28000 \
+  --listen-port 9000
 
 键盘操作：
-    按 Enter/回车: 按键触发持续推理模式（持续使用最新观测执行推理）
+    按 Enter/回车: 启动连续推理并持续下发动作给机器人端
+    输入 s: 停止连续推理
     输入 q: 退出程序
 
-持续推理模式：
-    按 Enter 后，程序会持续执行推理，每次使用最新的观测数据。
-    新动作序列到达机器人端时会立即替换旧序列，从第0步开始执行。
+扩展方式：
+    继承 ActionHandler 类，实现 on_action_ready() 方法处理动作，
+    例如发送到机器人执行、保存日志等。
 """
 
 import argparse
@@ -40,17 +49,14 @@ import threading
 import time
 from typing import Optional
 
-import cv2
-import numpy as np
-
 # ════════════════════════════════════════════════════════════════
-# 【关键】设置 Python 路径（必须在其他导入之前）
+# 【关键】设置 Python 路径
 # ════════════════════════════════════════════════════════════════
 _SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
-_OPENPI_ROOT = _SCRIPT_DIR.parent.parent / "openpi"
+_OPENPI_ROOT = _SCRIPT_DIR.parent.parent / "openpi-main"
 sys.path.insert(0, str(_OPENPI_ROOT / "src"))
+sys.path.insert(0, str(_OPENPI_ROOT / "packages" / "openpi-client" / "src"))
 
-# 设置 OPENPI_DATA_HOME（如果未设置）
 if "OPENPI_DATA_HOME" not in os.environ:
     os.environ["OPENPI_DATA_HOME"] = str(_OPENPI_ROOT / ".openpi_cache")
 
@@ -60,6 +66,8 @@ if "OPENPI_DATA_HOME" not in os.environ:
 os.environ["PYTORCH_DISABLE_TRITON"] = "1"
 os.environ["TORCH_COMPILE_DISABLE"] = "1"
 
+import cv2
+import numpy as np
 import torch
 torch._dynamo.config.suppress_errors = True
 
@@ -71,6 +79,10 @@ from openpi.shared import normalize as _normalize
 from openpi.training import config as _config
 
 
+# ════════════════════════════════════════════════════════════════
+# 常量配置
+# ════════════════════════════════════════════════════════════════
+
 DEFAULT_PROMPT = "right arm pick and place task"
 
 JOINT_NAMES_8D = [
@@ -81,11 +93,11 @@ JOINT_NAMES_8D = [
 
 
 # ════════════════════════════════════════════════════════════════
-# 数据转换类（与原脚本相同）
+# 数据转换类
 # ════════════════════════════════════════════════════════════════
 
 @dataclasses.dataclass(frozen=True)
-class RightArmInputs(_transforms.DataTransformFn):
+class RightArmHeadcamInputs(_transforms.DataTransformFn):
     """仅使用头部相机的输入转换"""
     def __call__(self, data: dict) -> dict:
         import einops
@@ -106,7 +118,6 @@ class RightArmInputs(_transforms.DataTransformFn):
 
         images_dict = data.get("images", data.get("image", {}))
 
-        # 仅提取头部相机图像
         extracted = []
         for key in ["cam_high"]:
             if key in images_dict:
@@ -116,7 +127,6 @@ class RightArmInputs(_transforms.DataTransformFn):
                     f"图像 key '{key}' 未找到。可用 key: {list(images_dict.keys())}"
                 )
 
-        # 仅使用头部相机，禁用腕部相机
         openpi_images = {
             "base_0_rgb": extracted[0],
             "left_wrist_0_rgb": np.zeros_like(extracted[0]),
@@ -171,12 +181,12 @@ def build_policy(
 ) -> _policy.Policy:
     """构建 OpenPI 右臂8维策略模型"""
     print("\n" + "=" * 70)
-    print("【构建策略 - 右臂8维】")
+    print("【构建策略 - 右臂8维，仅头部相机】")
     print("=" * 70)
 
     train_config = _config.TrainConfig(
         name="pi0_right_arm_infer",
-        model=pi0_config.Pi0Config(action_dim=32, pytorch_compile_mode=None),
+        model=pi0_config.Pi0Config(action_dim=32, pi05=False, pytorch_compile_mode=None),
         data=_config.FakeDataConfig(),
         policy_metadata={"checkpoint": str(checkpoint_dir)},
         assets_base_dir=str(checkpoint_dir.parent),
@@ -194,7 +204,7 @@ def build_policy(
     print(f"✓ norm_stats 加载完成: {list(norm_stats.keys())}")
 
     transforms = [
-        RightArmInputs(),
+        RightArmHeadcamInputs(),
         _transforms.Normalize(norm_stats, use_quantiles=False),
         PadStateTo32(),
         _transforms.ResizeImages(224, 224),
@@ -236,7 +246,7 @@ def build_policy(
 
 
 # ════════════════════════════════════════════════════════════════
-# 网络通信
+# 网络通信函数
 # ════════════════════════════════════════════════════════════════
 
 def send_msg(sock: socket.socket, obj: dict) -> None:
@@ -250,17 +260,15 @@ def recv_msg(sock: socket.socket, timeout: float = 10.0) -> Optional[dict]:
     """接收JSON消息"""
     sock.settimeout(timeout)
     try:
-        # 先读取4字节长度头
         header = _recv_exact(sock, 4)
         if header is None:
             return None
         length = struct.unpack(">I", header)[0]
 
-        if length > 10 * 1024 * 1024:  # 超过10MB，认为是非法数据
+        if length > 10 * 1024 * 1024:
             print(f"[RECV] 非法消息长度: {length}")
             return None
 
-        # 读取payload
         payload = _recv_exact(sock, length)
         if payload is None:
             return None
@@ -305,10 +313,6 @@ def decode_image(img_b64: str) -> Optional[np.ndarray]:
         return None
 
 
-# ════════════════════════════════════════════════════════════════
-# 打印函数
-# ════════════════════════════════════════════════════════════════
-
 def print_separator(title: str = ""):
     """打印分隔符"""
     if title:
@@ -319,75 +323,141 @@ def print_separator(title: str = ""):
         print(f"\n{'='*70}")
 
 
-def print_state_info(state_full: np.ndarray):
-    """打印状态信息"""
-    print("\n[输入状态 - 右臂8维] (弧度)")
-    for i, name in enumerate(JOINT_NAMES_8D):
-        deg = state_full[i] * 180.0 / math.pi
-        print(f"  {name}: {state_full[i]:.4f} ({deg:.3f}°)")
+# ════════════════════════════════════════════════════════════════
+# ActionHandler 基类 - 动作处理器接口
+# ════════════════════════════════════════════════════════════════
+
+class ActionHandler:
+    """
+    动作处理器基类
+    
+    扩展方式：
+        继承此类并实现 on_action_ready() 方法，
+        即可自定义动作处理逻辑（如发送到机器人、保存日志等）。
+    
+    示例：
+        class RobotActionHandler(ActionHandler):
+            def on_action_ready(self, action_msg: dict):
+                # 发送动作到机器人
+                send_msg(self.robot_socket, action_msg)
+    """
+
+    def on_action_ready(self, action_msg: dict):
+        """
+        推理完成后的回调
+        
+        Args:
+            action_msg: 包含以下字段的字典
+                - msg_type: 消息类型 ("action_sequence")
+                - obs_seq: 观测序列号
+                - actions: 机器人端执行的50步动作序列
+                - actions_50: 50步动作序列 (list of list, 单位: 度/原始值)
+                - infer_ms: 推理耗时 (毫秒)
+        """
+        pass
+
+    def on_error(self, error: Exception):
+        """错误处理回调"""
+        pass
 
 
-def print_inference_result(
-    state_deg: np.ndarray,
-    model_delta_deg: np.ndarray,
-    target_action_deg: np.ndarray,
-    inference_time: float,
-):
-    """打印推理结果"""
-    print("\n" + "=" * 70)
-    print("[推理结果 - 右臂8维]")
-    print("=" * 70)
+class PrintOnlyActionHandler(ActionHandler):
+    """
+    打印/保存动作处理器
+    
+    默认用于记录推理结果；动作下发由 RealtimeInferenceClient 完成。
+    """
 
-    print("  关节名称            │         当前状态 │          模型增量 │          目标角度")
-    print("  " + "─" * 23 + "┼" + "─" * 14 + "┼" + "─" * 14 + "┼" + "─" * 14)
+    def __init__(self, save_dir: pathlib.Path = None):
+        super().__init__()
+        self.save_dir = save_dir
+        self._infer_count = 0
 
-    for i, name in enumerate(JOINT_NAMES_8D):
-        def fmt(val):
-            return f"{val:+.3f}°"
-        print(f"  {name:<21} │ {fmt(state_deg[i]):>10} │ {fmt(model_delta_deg[i]):>10} │ {fmt(target_action_deg[i]):>10}")
-
-    print()
-    print(f"  推理耗时: {inference_time*1000:.1f}ms")
-    print("=" * 70)
+    def on_action_ready(self, action_msg: dict):
+        self._infer_count += 1
+        infer_num = self._infer_count
+        
+        # 保存动作数据
+        if self.save_dir:
+            self.save_dir.mkdir(parents=True, exist_ok=True)
+            action_path = self.save_dir / f"infer{infer_num:04d}_actions.json"
+            with open(action_path, 'w') as f:
+                json.dump(action_msg, f, indent=2)
+        
+        # 打印动作信息
+        print(f"\n{'='*70}")
+        print(f"[动作信息 - 已保存/准备下发给机器人]")
+        print(f"{'='*70}")
+        print(f"  obs_seq: {action_msg.get('obs_seq', 'N/A')}")
+        print(f"  infer_ms: {action_msg.get('infer_ms', 0):.1f}")
+        if self.save_dir:
+            print(f"  动作已保存: {action_path}")
+        actions_50 = action_msg.get('actions_50', [])
+        print(f"  50步动作序列 (deg): 共 {len(actions_50)} 步")
+        print(f"\n  {'步骤':<6} │ {'j0':<10} │ {'j1':<10} │ {'j2':<10} │ {'j3':<10} │ {'j4':<10} │ {'j5':<10} │ {'j6':<10} │ {'gripper':<8}")
+        print(f"  {'-'*6}─┼{'─'*11}┼{'─'*11}┼{'─'*11}┼{'─'*11}┼{'─'*11}┼{'─'*11}┼{'─'*11}┼{'─'*9}")
+        for step, action in enumerate(actions_50[:10]):
+            j_vals = [f"{action[i]:>+8.3f}" for i in range(7)]
+            g_val = f"{action[7]:>7.4f}"
+            print(f"  {step:<6} │ {' │ '.join(j_vals)} │ {g_val}")
+        if len(actions_50) > 10:
+            print(f"  ... (共 {len(actions_50)} 步)")
+        print(f"{'='*70}")
 
 
 # ════════════════════════════════════════════════════════════════
-# 实时推理客户端
+# RealtimeInferenceClient 类
 # ════════════════════════════════════════════════════════════════
 
 class RealtimeInferenceClient:
-    """实时推理客户端 - 接收机器人端观测，按键触发推理"""
+    """
+    实时推理客户端
+    
+    功能：
+    1. TCP服务器监听，接受机器人端连接
+    2. 接收线程持续接收观测数据
+    3. 按键触发推理
+    4. 通过 ActionHandler 处理推理结果
+    
+    Args:
+        policy: OpenPI策略模型
+        action_handler: 动作处理器 (默认: PrintOnlyActionHandler)
+        save_dir: 保存目录，保存输入图片和动作
+    """
 
-    def __init__(self, policy, robot_host: str, robot_port: int,
-                 save_debug_images: bool = True):
+    def __init__(self, policy, action_handler: ActionHandler = None,
+                 save_dir: pathlib.Path = None,
+                 gripper_threshold: float = 0.5):
         self.policy = policy
-        self.robot_host = robot_host
-        self.robot_port = robot_port
-        self.save_debug_images = save_debug_images
+        self.action_handler = action_handler or PrintOnlyActionHandler(save_dir)
+        self.save_dir = save_dir
+        self.gripper_threshold = gripper_threshold
+        
+        # 如果 action_handler 是默认的 PrintOnlyActionHandler 且没有指定 save_dir
+        if isinstance(self.action_handler, PrintOnlyActionHandler) and self.action_handler.save_dir is None:
+            self.action_handler.save_dir = save_dir
 
         self._sock: Optional[socket.socket] = None
         self._running = False
         self._client_connected = False
 
-        # 最新观测数据
         self._latest_obs = None
         self._obs_lock = threading.Lock()
         self._obs_count = 0
 
-        # 推理统计
         self._infer_count = 0
         self._action_count = 0
+        self._continuous_infer = False
+        self._continuous_thread: Optional[threading.Thread] = None
 
-        # 调试保存目录
-        self._debug_dir = pathlib.Path("debug_inference")
-        if self.save_debug_images:
-            self._debug_dir.mkdir(exist_ok=True)
+        if self.save_dir:
+            self.save_dir.mkdir(parents=True, exist_ok=True)
 
     def _accept_connection(self, server_sock: socket.socket):
         """接受机器人端连接"""
-        print(f"\n[等待] 等待机器人端连接 {self.robot_host}:{self.robot_port}...")
+        print(f"\n[等待] 等待机器人端连接...")
         server_sock.settimeout(1.0)
-        
+
         while self._running:
             try:
                 client_sock, addr = server_sock.accept()
@@ -420,22 +490,15 @@ class RealtimeInferenceClient:
                         self._latest_obs = msg
                         self._obs_count += 1
 
-                    # 每30帧打印一次状态
                     if self._obs_count % 30 == 0:
                         obs_seq = msg.get("obs_seq", 0)
-                        ts_ns = msg.get("ts_ns", 0)
-                        ts_sec = ts_ns / 1e9
                         joints_r = msg.get("joints_right", [])
                         images = msg.get("images", {})
                         head_ok = images.get("head") is not None
-                        right_arm_ok = images.get("right_arm") is not None
-                        left_arm_ok = images.get("left_arm") is not None
 
                         print(f"[接收 #{self._obs_count}] seq={obs_seq}, "
                               f"joints_r={joints_r[:3] if joints_r else 'N/A'}..., "
-                              f"head={'OK' if head_ok else 'FAIL'}, "
-                              f"right_arm={'OK' if right_arm_ok else 'FAIL'}, "
-                              f"left_arm={'OK' if left_arm_ok else 'FAIL'}")
+                              f"head={'OK' if head_ok else 'FAIL'}")
 
             except Exception as e:
                 print(f"[接收] 接收异常: {e}")
@@ -446,8 +509,72 @@ class RealtimeInferenceClient:
         with self._obs_lock:
             return self._latest_obs
 
+    def _format_robot_actions(self, actions_50_deg: np.ndarray) -> list[dict]:
+        """转换为 robot_executor.py 期望的 action_sequence 单步格式。"""
+        robot_actions = []
+        for action in actions_50_deg:
+            action_list = [float(x) for x in action.tolist()]
+            gripper_raw = action_list[7]
+            gripper_cmd = 1.0 if gripper_raw >= self.gripper_threshold else 0.0
+            robot_actions.append({
+                "joints_right": action_list[:7],
+                "dexhand_right": gripper_cmd,
+                "dexhand_right_raw": gripper_raw,
+            })
+        return robot_actions
+
+    def _send_action_sequence(self, action_msg: dict) -> bool:
+        """下发动作序列到机器人端。"""
+        if self._sock is None or not self._client_connected:
+            print("[错误] 机器人端未连接，动作未下发")
+            return False
+
+        send_msg(self._sock, action_msg)
+        self._action_count += 1
+        print(f"[下发] 动作序列已发送给机器人: obs_seq={action_msg.get('obs_seq')}, "
+              f"步数={len(action_msg.get('actions', []))}, "
+              f"累计下发={self._action_count}")
+        return True
+
+    def _continuous_inference_loop(self):
+        """连续推理并持续下发动作序列。"""
+        print("[连续推理] 已启动：每次推理完成后立即下发下一段50步动作")
+        while self._running and self._continuous_infer:
+            try:
+                action_msg = self.run_inference()
+                if action_msg is None:
+                    time.sleep(0.1)
+            except Exception as e:
+                print(f"[连续推理] 推理/下发异常: {e}")
+                import traceback
+                traceback.print_exc()
+                time.sleep(0.1)
+        print("[连续推理] 已停止")
+
+    def _start_continuous_inference(self):
+        """启动连续推理线程。"""
+        if self._continuous_thread is not None and self._continuous_thread.is_alive():
+            print("[连续推理] 已经在运行，无需重复启动")
+            return
+
+        self._continuous_infer = True
+        self._continuous_thread = threading.Thread(
+            target=self._continuous_inference_loop,
+            name="CONTINUOUS_INFER",
+            daemon=True,
+        )
+        self._continuous_thread.start()
+
+    def _stop_continuous_inference(self):
+        """停止连续推理线程。"""
+        if not self._continuous_infer:
+            print("[连续推理] 当前未运行")
+            return
+        print("[连续推理] 正在停止，当前推理完成后生效...")
+        self._continuous_infer = False
+
     def run_inference(self):
-        """使用最新观测执行推理并发送动作"""
+        """使用最新观测执行推理并处理动作"""
         self._infer_count += 1
         infer_num = self._infer_count
 
@@ -460,7 +587,6 @@ class RealtimeInferenceClient:
             print("[错误] 等待机器人端观测数据...")
             return None
 
-        # ========== 调试信息：原始观测数据 ==========
         obs_seq = obs.get("obs_seq", 0)
         ts_ns = obs.get("ts_ns", 0)
         joints_right = obs.get("joints_right", [])
@@ -469,51 +595,36 @@ class RealtimeInferenceClient:
 
         print(f"\n[观测原始数据]")
         print(f"  obs_seq: {obs_seq}")
-        print(f"  时间戳: {ts_ns} ({time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ts_ns/1e9))})")
-        print(f"  joints_right (度): {[f'{x:.2f}' for x in joints_right]}")
+        print(f"  时间戳: {ts_ns} ({time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ts_ns/1e9)) if ts_ns else 'N/A'})")
+        print(f"  joints_right (deg): {[f'{x:.2f}' for x in joints_right]}")
         print(f"  dexhand_right: {dexhand_right}")
         print(f"  图像keys: {list(images_raw.keys())}")
-        print(f"  head图像: {'有' if images_raw.get('head') else '无'} ({len(images_raw.get('head', ''))//1024}KB)")
-        print(f"  right_arm图像: {'有' if images_raw.get('right_arm') else '无'} ({len(images_raw.get('right_arm', ''))//1024}KB)")
-        print(f"  left_arm图像: {'有' if images_raw.get('left_arm') else '无'}")
 
-        # ========== 解码图像 ==========
         head_img = decode_image(images_raw.get("head"))
-
-        print(f"\n[图像解码]")
-        print(f"  head_img: {'成功' if head_img is not None else '失败'} {head_img.shape if head_img is not None else ''}")
+        print(f"\n[图像解码] head_img: {'成功' if head_img is not None else '失败'} {head_img.shape if head_img is not None else ''}")
 
         if head_img is None:
             print("[错误] 头部图像数据无效")
             return None
 
-        # ========== 保存输入图像 ==========
-        if self.save_debug_images:
-            head_path = self._debug_dir / f"infer{infer_num:03d}_head.jpg"
-            cv2.imwrite(str(head_path), head_img)
-            print(f"\n[保存] 输入图像已保存到 {self._debug_dir}/")
-            print(f"  - {head_path.name}")
+        # 保存输入图片
+        if self.save_dir:
+            img_path = self.save_dir / f"infer{infer_num:04d}_input_image.jpg"
+            cv2.imwrite(str(img_path), head_img)
+            print(f"\n[保存] 输入图片已保存: {img_path}")
 
-        # ========== 获取关节状态 ==========
         if len(joints_right) < 7:
             print(f"[错误] 关节数据不足: {joints_right}")
             return None
 
-        # 机械臂发送的是度数，需要转换为弧度给模型
         joints_right_rad = [deg * math.pi / 180.0 for deg in joints_right[:7]]
-
-        # 构造8维状态（弧度）
         state_full = np.array(joints_right_rad + [float(dexhand_right)], dtype=np.float32)
 
-        # ========== 打印输入状态 ==========
         print(f"\n[模型输入状态 - 8维右臂]")
         for i, name in enumerate(JOINT_NAMES_8D):
             deg = state_full[i] if i == 7 else state_full[i] * 180.0 / math.pi
             print(f"  {name}: {state_full[i]:.4f} rad ({deg:.3f}°)")
 
-        # ========== 构造模型输入 ==========
-        # 注意：cv2.imdecode 返回 BGR，转为 RGB
-        # 只使用头部相机图像
         model_obs = {
             "state": state_full,
             "images": {
@@ -522,113 +633,85 @@ class RealtimeInferenceClient:
             "prompt": DEFAULT_PROMPT,
         }
 
-        # ========== 调试：验证图像内容 ==========
-        if self.save_debug_images:
-            # 保存 resize 前的图像
-            head_orig = cv2.cvtColor(head_img, cv2.COLOR_BGR2RGB)
-
-            # 模拟 resize (使用 PIL like the model does)
-            from PIL import Image as PILImage
-            def resize_with_pad_pil(img, h, w):
-                pil_img = PILImage.fromarray(img)
-                ratio = max(pil_img.width / w, pil_img.height / h)
-                new_w = int(pil_img.width / ratio)
-                new_h = int(pil_img.height / ratio)
-                pil_resized = pil_img.resize((new_w, new_h), PILImage.BILINEAR)
-                zero_img = PILImage.new('RGB', (w, h), 0)
-                pad_x = (w - new_w) // 2
-                pad_y = (h - new_h) // 2
-                zero_img.paste(pil_resized, (pad_x, pad_y))
-                return np.array(zero_img)
-
-            head_resized = resize_with_pad_pil(head_orig, 224, 224)
-
-            # 保存 resize 后的图像用于对比
-            cv2.imwrite(str(self._debug_dir / f"infer{infer_num:03d}_head_224.jpg"), cv2.cvtColor(head_resized, cv2.COLOR_RGB2BGR))
-
-            # 打印图像统计信息
-            print(f"\n[图像统计]")
-            print(f"  head原始: shape={head_orig.shape}, mean={head_orig.mean():.1f}, min={head_orig.min()}, max={head_orig.max()}")
-            print(f"  head_224: shape={head_resized.shape}, mean={head_resized.mean():.1f}, min={head_resized.min()}, max={head_resized.max()}")
-
-        # ========== 执行推理 ==========
         print(f"\n[推理] 执行推理中...")
         t_infer_start = time.time()
         result = self.policy.infer(model_obs)
         inference_time = time.time() - t_infer_start
         print(f"[推理] 完成，耗时: {inference_time*1000:.1f}ms")
 
-        # ========== 解析输出 ==========
-        # 注意：result["actions"] shape 为 (50, 8)，包含50步动作序列
-        all_actions = result["actions"]  # shape: (50, 8)
+        actions_50 = np.asarray(result["actions"], dtype=np.float32)
+        if actions_50.ndim != 2 or actions_50.shape[1] < 8:
+            print(f"[错误] 模型输出动作维度异常: {actions_50.shape}")
+            return None
 
-        # 构建50步动作序列
-        action_sequence = []
-        for i in range(50):
-            model_action = np.asarray(all_actions[i], dtype=np.float32)
-            target_action_deg = model_action * 180.0 / np.pi
-            target_action_deg[7] = model_action[7]  # 夹爪是0-1值
+        # 将输出动作转换为角度 (与离线脚本一致: 前7维转度，第8维保持原始值)
+        actions_50_deg = np.zeros_like(actions_50)
+        actions_50_deg[:, :7] = actions_50[:, :7] * 180.0 / math.pi
+        actions_50_deg[:, 7] = actions_50[:, 7]
 
-            action_sequence.append({
-                "joints_right": target_action_deg[:7].tolist(),
-                "dexhand_right": 1.0 if float(np.clip(model_action[7], 0.0, 1.0)) > 0.5 else 0.0,
-            })
+        if not np.isfinite(actions_50_deg).all():
+            print("[错误] 模型输出包含 NaN/Inf，动作未下发")
+            return None
 
-        # ========== 打印推理结果 ==========
+        # 打印推理结果 (与离线脚本一致的格式)
         print(f"\n{'='*70}")
-        print(f"[推理结果 #{infer_num}] - 50步动作序列")
+        print(f"[推理结果 #{infer_num} - 50步动作序列]")
         print(f"{'='*70}")
-        print(f"\n  第1步目标关节角度: {[f'{x:.2f}' for x in action_sequence[0]['joints_right']]}")
-        print(f"  第25步目标关节角度: {[f'{x:.2f}' for x in action_sequence[24]['joints_right']]}")
-        print(f"  第50步目标关节角度: {[f'{x:.2f}' for x in action_sequence[49]['joints_right']]}")
-        print(f"\n  推理耗时: {inference_time*1000:.1f}ms")
-        print(f"  动作序列长度: {len(action_sequence)} 步")
 
-        # ========== 构建动作序列消息 ==========
+        print(f"\n  {'步骤':<6} │ {'j0(°)':<10} │ {'j1(°)':<10} │ {'j2(°)':<10} │ {'j3(°)':<10} │ {'j4(°)':<10} │ {'j5(°)':<10} │ {'j6(°)':<10} │ {'gripper':<8}")
+        print(f"  {'-'*6}─┼{'─'*11}┼{'─'*11}┼{'─'*11}┼{'─'*11}┼{'─'*11}┼{'─'*11}┼{'─'*11}┼{'─'*9}")
+
+        for step in range(min(10, len(actions_50_deg))):
+            action = actions_50_deg[step]
+            j_vals = [f"{action[i]:>+8.3f}" for i in range(7)]
+            g_val = f"{action[7]:>7.4f}"
+            print(f"  {step:<6} │ {' │ '.join(j_vals)} │ {g_val}")
+
+        if len(actions_50_deg) > 10:
+            print(f"  ... (共 {len(actions_50_deg)} 步)")
+
+        print(f"\n  推理耗时: {inference_time*1000:.1f}ms")
+
+        robot_actions = self._format_robot_actions(actions_50_deg[:, :8])
+        gripper_raw = actions_50_deg[:, 7]
+        gripper_close_count = sum(a["dexhand_right"] >= 0.5 for a in robot_actions)
+        print(f"  夹爪raw范围: min={float(gripper_raw.min()):.6f}, "
+              f"max={float(gripper_raw.max()):.6f}, "
+              f"threshold={self.gripper_threshold:.6f}, "
+              f"闭合步数={gripper_close_count}/{len(robot_actions)}")
         action_msg = {
             "msg_type": "action_sequence",
             "obs_seq": obs_seq,
-            "actions": action_sequence,
+            "actions": robot_actions,
+            "actions_50": actions_50_deg[:, :8].tolist(),
             "infer_ms": inference_time * 1000,
         }
 
-        # ========== 打印即将发送的动作序列 ==========
-        print(f"\n{'='*70}")
-        print(f"[发送动作序列 #{infer_num}]")
-        print(f"{'='*70}")
-        print(f"  obs_seq: {action_msg['obs_seq']}")
-        print(f"  动作步数: {len(action_msg['actions'])}")
-        print(f"  第1步: joints_right={[f'{x:.2f}' for x in action_msg['actions'][0]['joints_right']]}")
-        print(f"  第1步: dexhand_right={action_msg['actions'][0]['dexhand_right']}")
-        print(f"  infer_ms: {action_msg['infer_ms']:.1f}")
-        print(f"  (左臂保持原位，不执行)")
+        try:
+            self.action_handler.on_action_ready(action_msg)
+        except Exception as e:
+            print(f"[错误] ActionHandler 处理失败: {e}")
+            self.action_handler.on_error(e)
 
-        # ========== 发送动作序列 ==========
-        if self._sock:
-            try:
-                send_msg(self._sock, action_msg)
-                self._action_count += 1
-                print(f"\n[发送成功] ✓ (动作序列#{self._action_count})")
-                print(f"{'='*70}")
-            except Exception as e:
-                print(f"[发送失败] {e}")
-                return None
-        else:
-            print("[错误] 未连接到机器人端")
-            return None
+        try:
+            self._send_action_sequence(action_msg)
+        except Exception as e:
+            print(f"[错误] 动作下发失败: {e}")
+            self.action_handler.on_error(e)
 
         return action_msg
 
     def run(self, listen_port: int):
         """运行推理客户端"""
         print("\n" + "=" * 70)
-        print("【OpenPI 真机实时推理客户端】")
+        print("【OpenPI 真机实时推理客户端 - 右臂8维，仅头部相机】")
         print("=" * 70)
         print(f"监听端口: {listen_port}")
-        print(f"机器人地址: {self.robot_host}:{self.robot_port}")
+        print(f"使用校正: 无（模型输出直接使用）")
+        print(f"夹爪阈值: 模型输出 >= {self.gripper_threshold} 时下发闭合(1)，否则张开(0)")
+        print(f"动作处理: {self.action_handler.__class__.__name__}")
         print("=" * 70)
 
-        # 创建TCP服务器
         server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server_sock.bind(("0.0.0.0", listen_port))
@@ -637,95 +720,50 @@ class RealtimeInferenceClient:
 
         self._running = True
 
-        # 启动接收线程
         recv_thread = threading.Thread(target=self._receive_obs_loop, daemon=True)
         recv_thread.start()
 
-        # 等待机器人端连接
         self._accept_connection(server_sock)
 
-        # 键盘控制循环
         print_separator("键盘控制模式")
         print("操作说明:")
-        print("  按 Enter/回车: 触发持续推理模式（持续使用最新观测执行推理）")
+        print("  按 Enter/回车: 启动连续推理，并持续下发动作给机器人端")
+        print("  输入 s: 停止连续推理")
         print("  输入 q: 退出程序")
         print("=" * 70)
 
         last_obs_time = "无"
-        last_action = None
-        continuous_mode = False  # 是否处于持续推理模式
-        continuous_count = 0    # 持续推理计数
 
         try:
             while self._running:
-                # 显示最新观测状态
                 obs = self.get_latest_obs()
                 if obs:
                     ts_ns = obs.get("ts_ns", 0)
                     if ts_ns > 0:
                         last_obs_time = time.strftime("%H:%M:%S", time.localtime(ts_ns / 1e9))
 
-                if continuous_mode:
-                    print(f"\n[持续推理模式] 推理#{continuous_count+1}, 观测时间: {last_obs_time}, 已发送: {self._action_count}")
-                else:
-                    print(f"\n[等待按键] 最新观测时间: {last_obs_time}, 已接收: {self._obs_count}, 已推理: {self._infer_count}, 已发送: {self._action_count}")
+                infer_status = "运行中" if self._continuous_infer else "未运行"
+                print(f"\n[等待按键] 最新观测时间: {last_obs_time}, 已接收: {self._obs_count}, "
+                      f"已推理: {self._infer_count}, 连续推理: {infer_status}")
 
                 try:
-                    user_input = input("按回车触发/停止持续推理，或输入 q 退出: ").strip()
+                    user_input = input("按回车启动连续推理，输入 s 停止，输入 q 退出: ").strip()
                 except EOFError:
                     break
 
-                # 退出
                 if user_input.lower() == 'q':
                     print("\n[退出] 正在关闭连接...")
                     break
+                if user_input.lower() == 's':
+                    self._stop_continuous_inference()
+                    continue
 
-                # 切换持续推理模式
-                if not continuous_mode:
-                    continuous_mode = True
-                    continuous_count = 0
-                    print("\n[持续推理模式] 已启动，按 Enter 停止...")
-
-                    # 持续推理循环
-                    while continuous_mode and self._running:
-                        # 执行一次推理
-                        try:
-                            action_msg = self.run_inference()
-                            if action_msg:
-                                last_action = action_msg
-                                continuous_count += 1
-                                # 不等待，持续推理
-                                if continuous_count % 10 == 0:
-                                    print(f"[持续推理] 已完成 {continuous_count} 次推理")
-                        except Exception as e:
-                            print(f"[错误] 推理失败: {e}")
-                            import traceback
-                            traceback.print_exc()
-                            time.sleep(0.5)  # 失败后短暂休眠
-
-                        # 检查是否还有等待输入（非阻塞）
-                        import select
-                        if select.select([sys.stdin], [], [], 0.0)[0]:
-                            try:
-                                user_input = input().strip()
-                                if user_input.lower() == 'q':
-                                    continuous_mode = False
-                                    self._running = False
-                                    break
-                                else:
-                                    # 其他输入停止持续推理
-                                    continuous_mode = False
-                                    print("\n[持续推理模式] 已停止")
-                                    break
-                            except EOFError:
-                                break
-                else:
-                    continuous_mode = False
-                    print("\n[持续推理模式] 已停止")
+                self._start_continuous_inference()
 
         except KeyboardInterrupt:
             print("\n[中断] 收到 Ctrl+C")
         finally:
+            self._continuous_infer = False
             self._running = False
             if self._sock:
                 self._sock.close()
@@ -738,8 +776,11 @@ class RealtimeInferenceClient:
 # ════════════════════════════════════════════════════════════════
 
 def main():
+    # 默认保存目录
+    DEFAULT_SAVE_DIR = pathlib.Path("/home/dmh/xyj_zhipingfang/model3_openpi0.5/my_bot2_deployment/4090deployment/realtime_inference_results")
+
     parser = argparse.ArgumentParser(
-        description="OpenPI 真机实时推理客户端",
+        description="OpenPI 右臂8维真机实时推理 - 推理并下发动作",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
@@ -747,12 +788,6 @@ def main():
         type=str,
         required=True,
         help="Checkpoint 目录路径"
-    )
-    parser.add_argument(
-        "--robot-host",
-        type=str,
-        default="192.168.1.100",
-        help="机器人IP（默认: 192.168.1.100）"
     )
     parser.add_argument(
         "--listen-port",
@@ -767,6 +802,29 @@ def main():
         choices=["cuda", "cpu"],
         help="推理设备（默认: cuda）"
     )
+    parser.add_argument(
+        "--fixed-noise-seed",
+        type=int,
+        default=42,
+        help="固定推理噪声 seed（用于调试重复性）"
+    )
+    parser.add_argument(
+        "--save-dir",
+        type=str,
+        default=str(DEFAULT_SAVE_DIR),
+        help=f"保存目录（默认: {DEFAULT_SAVE_DIR}）"
+    )
+    parser.add_argument(
+        "--no-save",
+        action="store_true",
+        help="不保存推理结果"
+    )
+    parser.add_argument(
+        "--gripper-threshold",
+        type=float,
+        default=0.5,
+        help="夹爪二值化阈值：模型第8维输出 >= 阈值时下发闭合(1)，否则张开(0)（默认: 0.5）"
+    )
 
     args = parser.parse_args()
 
@@ -776,25 +834,36 @@ def main():
         print(f"错误: Checkpoint 目录不存在: {checkpoint_dir}")
         sys.exit(1)
 
-    # GPU 检查
     if args.device == "cuda" and not torch.cuda.is_available():
         print("警告: CUDA 不可用，降级到 CPU")
         args.device = "cpu"
 
+    # 保存目录
+    save_dir = None if args.no_save else pathlib.Path(args.save_dir)
+
     # 1. 构建策略模型
     t_start_total = time.time()
-    policy = build_policy(checkpoint_dir, DEFAULT_PROMPT, args.device)
+    policy = build_policy(checkpoint_dir, DEFAULT_PROMPT, args.device, args.fixed_noise_seed)
     t_model_load = time.time()
     print(f"\n模型加载耗时: {t_model_load - t_start_total:.2f} 秒")
 
     # 2. 创建推理客户端
+    print("\n" + "=" * 70)
+    print("【启动真机实时推理模式】")
+    print("=" * 70)
+    print(f"Checkpoint: {checkpoint_dir}")
+    print(f"监听端口: {args.listen_port}")
+    print(f"保存目录: {save_dir if save_dir else '不保存'}")
+    print(f"夹爪阈值: {args.gripper_threshold}")
+    print("=" * 70)
+
+    action_handler = PrintOnlyActionHandler(save_dir)
     client = RealtimeInferenceClient(
         policy=policy,
-        robot_host=args.robot_host,
-        robot_port=args.listen_port,  # 注意：端口复用
+        action_handler=action_handler,
+        save_dir=save_dir,
+        gripper_threshold=args.gripper_threshold,
     )
-
-    # 3. 运行客户端
     client.run(args.listen_port)
 
 

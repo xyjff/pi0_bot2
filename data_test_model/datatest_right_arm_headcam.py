@@ -743,7 +743,7 @@ def main():
     parser.add_argument(
         "--fixed-noise-seed",
         type=int,
-        default=None,
+        default=42,
         help="固定推理噪声 seed（用于调试重复性）"
     )
     parser.add_argument(
