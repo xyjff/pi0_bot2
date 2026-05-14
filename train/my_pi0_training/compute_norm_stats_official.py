@@ -1,4 +1,18 @@
-"""Offline-friendly norm stats computation using official OpenPI flow."""
+"""Offline-friendly norm stats computation using official OpenPI flow.
+
+source /share/0xyj/model3_openpi0.5/openpi-main/.venv/bin/activate && python /share/0xyj/model3_openpi0.5/my_pi0_training/compute_norm_stats_official.py \
+    --repo_id local/right_arm_head_cam \
+    --dataset_path /share/0xyj/model3_openpi0.5/my_pi0_training/hdf5_to_lerobot_data/lerobot_dataset_headcam_rightarm125 \
+    --action_horizon 50 \
+    --action_dim 8 \
+    --batch_size 32 \
+    --num_workers 0 \
+    --output_dir /share/0xyj/model3_openpi0.5/openpi-main/assets/pi0_right_arm_head_cam_125_state_True
+    
+    
+    
+
+"""
 
 import os
 import pathlib
@@ -20,6 +34,7 @@ import openpi.shared.normalize as normalize
 import openpi.training.config as _config
 import openpi.training.data_loader as _data_loader
 import openpi.transforms as _transforms
+from my_config_right_arm_head_cam import MyRobotInputs
 
 # Ensure JAX doesn't compete for CUDA while loading stats.
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
@@ -49,6 +64,45 @@ def _apply_offline_patches() -> None:
     ds_utils.get_safe_version = patched_get_safe_version
     if hasattr(lerobot_dataset, "get_safe_version"):
         lerobot_dataset.get_safe_version = patched_get_safe_version
+
+    def patched_load_tasks(root: pathlib.Path):
+        import json
+        tasks_path = root / "meta" / "tasks.jsonl"
+        tasks = {}
+        if tasks_path.exists():
+            with open(tasks_path, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if line:
+                        item = json.loads(line)
+                        tasks[int(item["task_index"])] = item["task"]
+        task_to_task_index = {task: task_index for task_index, task in tasks.items()}
+        return tasks, task_to_task_index
+
+    def patched_load_episodes_stats(root: pathlib.Path):
+        import json
+        stats_path = root / "meta" / "episodes_stats.jsonl"
+        if not stats_path.exists():
+            return {}
+        episodes_stats = {}
+        with open(stats_path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if line:
+                    item = json.loads(line)
+                    # cast_stats_to_numpy must be applied: converts flat lists → np.ndarrays,
+                    # matching what aggregate_stats() expects.
+                    episodes_stats[item["episode_index"]] = ds_utils.cast_stats_to_numpy(item["stats"])
+        return episodes_stats
+
+    if hasattr(ds_utils, "load_tasks"):
+        ds_utils.load_tasks = patched_load_tasks
+    if hasattr(lerobot_dataset, "load_tasks"):
+        lerobot_dataset.load_tasks = patched_load_tasks
+    if hasattr(ds_utils, "load_episodes_stats"):
+        ds_utils.load_episodes_stats = patched_load_episodes_stats
+    if hasattr(lerobot_dataset, "load_episodes_stats"):
+        lerobot_dataset.load_episodes_stats = patched_load_episodes_stats
 
     def _class_get_video_file_path(self_meta, ep_index: int, vid_key: str):
         cs = self_meta.info.get("chunks_size", 1000)
@@ -152,10 +206,11 @@ def main(
     dataset_path: str = _DEFAULT_DATASET_PATH,
     action_horizon: int = 50,
     action_dim: int = 8,
+    include_gripper_state_input: bool = True,   
     batch_size: int = 32,
-    num_workers: int = 4,
-    max_frames: int | None = None,
-    output_dir: str = "/share/0xyj/model3_openpi0.5/openpi-main/assets/pi0_right_arm_head_cam",
+    num_workers: int = 0,  # Must be 0 for offline datasets (lerobot patch not fork-safe)
+    max_frames: int | None = None,  
+    output_dir: str = "/share/0xyj/model3_openpi0.5/openpi-main/assets/pi0_right_arm_head_cam_125",
 ):
     """Compute normalization statistics fully offline from local dataset."""
     _apply_offline_patches()
@@ -168,6 +223,10 @@ def main(
     )
 
     data_transforms = _transforms.Group(
+        inputs=[MyRobotInputs(include_gripper_state_input=include_gripper_state_input)],
+        outputs=[],
+    )
+    data_transforms = data_transforms.push(
         inputs=[_transforms.DeltaActions(_transforms.make_bool_mask(7, -1))],
         outputs=[_transforms.AbsoluteActions(_transforms.make_bool_mask(7, -1))],
     )
@@ -202,6 +261,7 @@ def main(
     print(f"Assets dir: {assets_dir}")
     print(f"Action horizon: {action_horizon}")
     print(f"Action dim: {action_dim}")
+    print(f"Include gripper state input: {include_gripper_state_input}")
     print(f"Batch size: {batch_size}")
     print(f"Num workers: {num_workers}")
 

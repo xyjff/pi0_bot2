@@ -12,7 +12,7 @@ import openpi.training.optimizer as _optimizer
 import openpi.transforms as _transforms
 
 OPENPI_DIR = Path("/share/0xyj/model3_openpi0.5/openpi-main")
-DATASET_PATH = "/share/0xyj/model3_openpi0.5/my_pi0_training/hdf5_to_lerobot_data/lerobot_dataset_headcam_rightarm"
+DATASET_PATH = "/share/0xyj/model3_openpi0.5/my_pi0_training/hdf5_to_lerobot_data/lerobot_dataset_headcam_rightarm125"
 WEIGHT_PATH = "/share/0xyj/model3_openpi0.5/pi0_base"
 REPO_ID = "local/right_arm_head_cam"
 
@@ -40,6 +40,8 @@ def _to_numpy_hwc_uint8(img) -> np.ndarray:
 class MyRobotInputs(_transforms.DataTransformFn):
     """Map dataset fields to OpenPI canonical fields."""
 
+    include_gripper_state_input: bool = False
+
     def __call__(self, data: dict) -> dict:
         images = data["images"]
         state = np.asarray(data["state"], dtype=np.float32)
@@ -48,6 +50,9 @@ class MyRobotInputs(_transforms.DataTransformFn):
             state = state[..., :8]
         else:
             state = state[:8]
+        if not self.include_gripper_state_input and state.shape[-1] > 7:
+            state = state.copy()
+            state[..., 7] = 0.0
         if actions.ndim >= 2:
             actions = actions[..., :8]
 
@@ -86,6 +91,7 @@ class MyDataConfig(_config.DataConfigFactory):
     repo_id: str = REPO_ID
     local_root: str | None = DATASET_PATH
     use_delta_joint_actions: bool = True
+    include_gripper_state_input: bool = False
     default_prompt: str | None = "right arm pick and place task"
     prompt_from_task: bool = False
     action_sequence_keys: Sequence[str] = ("action",)
@@ -106,7 +112,7 @@ class MyDataConfig(_config.DataConfigFactory):
 
     def create(self, assets_dirs, model_config) -> _config.DataConfig:
         data_transforms = _transforms.Group(
-            inputs=[MyRobotInputs()],
+            inputs=[MyRobotInputs(include_gripper_state_input=self.include_gripper_state_input)],
             outputs=[MyRobotOutputs()],
         )
         if self.use_delta_joint_actions:
@@ -156,7 +162,7 @@ def get_my_configs() -> list[_config.TrainConfig]:
                 decay_lr=5e-6,
             ),
             ema_decay=0.999,
-            wandb_enabled=True,
+            wandb_enabled=False,
             overwrite=False,
         )
     ]

@@ -24,8 +24,8 @@ import time
 # =============================================================================
 # 1、进入环境：       source /share/0xyj/model3_openpi0.5/openpi-main/.venv/bin/activate
 # 2、路径修改
-INPUT_DIR = r'/share/0xyj/datasate_baocun/task_657_14双臂+4路摄像头+2灵巧手4.22新采集数据/ds_635_31_657_14双臂+4路摄像头+2灵巧手4.22新采集数据'          # 输入 HDF5 文件所在目录
-OUTPUT_DIR = r'/share/0xyj/model3_openpi0.5/my_pi0_training/hdf5_to_lerobot_data/lerobot_dataset_headcam_rightarm'      # 输出目录（修改为只保留头部+右臂版本）
+INPUT_DIR = r'/share/0xyj/datasate_baocun/task_698_14双臂+4路摄像头+2灵巧手26.5.13晚上测试--光照问题/ds_681_31_698_14双臂+4路摄像头+2灵巧手26.5.13晚上测试--光照问题'          # 输入 HDF5 文件所在目录/share/0xyj/datasate_baocun/task_657_14双臂+4路摄像头+2灵巧手4.22新采集数据--test
+OUTPUT_DIR = r'/share/0xyj/model3_openpi0.5/my_pi0_training/hdf5_to_lerobot_data/lerobot_dataset_headcam_rightarm2_wanshangtestgaungzhao'      # 输出目录（修改为只保留头部+右臂版本）
 FPS = 30
 CHUNK_SIZE = 1000
 
@@ -110,6 +110,7 @@ def process_dataset():
         }
 
     episodes_metadata = []
+    episodes_stats_list = []  # per-episode stats for episodes_stats.jsonl
     global_frame_counter = 0
     total_frames = 0
 
@@ -205,6 +206,8 @@ def process_dataset():
             # -------------------------------------------------------------
             # D. 保存具体每一帧的 Parquet 数据
             # -------------------------------------------------------------
+            # LeRobot 1-based index; instruction 取第一个任务指令
+            instruction_col = [TASK_INSTRUCTIONS[0]] * num_frames
             data_dict = {
                 'observation.state': list(state),
                 'observation.effort': list(effort),
@@ -213,8 +216,9 @@ def process_dataset():
                 'frame_index': np.arange(num_frames, dtype=np.int64),
                 'timestamp': timestamps,
                 'next.done': np.full(num_frames, False, dtype=bool),
-                'index': np.arange(global_frame_counter, global_frame_counter + num_frames, dtype=np.int64),
-                'task_index': np.full(num_frames, DEFAULT_TASK_INDEX, dtype=np.int64)
+                'index': np.arange(global_frame_counter + 1, global_frame_counter + num_frames + 1, dtype=np.int64),
+                'task_index': np.full(num_frames, DEFAULT_TASK_INDEX, dtype=np.int64),
+                'instruction': instruction_col,
             }
             data_dict['next.done'][-1] = True
 
@@ -233,19 +237,33 @@ def process_dataset():
                 pa.field('timestamp', pa.float32()),
                 pa.field('next.done', pa.bool_()),
                 pa.field('index', pa.int64()),
-                pa.field('task_index', pa.int64())
+                pa.field('task_index', pa.int64()),
+                pa.field('instruction', pa.string()),
             ]
             pq.write_table(pa.Table.from_pydict(data_dict, schema=pa.schema(fields)), str(data_dir / f'file-{episode_idx:03d}.parquet'))
 
-            # -------------------------------------------------------------
-            # E. 记录此集片段的大纲统计
-            # -------------------------------------------------------------
+            # E1. Per-episode stats (for episodes_stats.jsonl)
+            ep_stats = {'episode_index': episode_idx, 'stats': {}}
+            for col in ['observation.state', 'observation.effort', 'action']:
+                data = np.stack(data_dict[col])
+                ep_stats['stats'][f'{col}/min'] = data.min(axis=0).tolist()
+                ep_stats['stats'][f'{col}/max'] = data.max(axis=0).tolist()
+                ep_stats['stats'][f'{col}/mean'] = data.mean(axis=0).tolist()
+                ep_stats['stats'][f'{col}/std'] = data.std(axis=0).tolist()
+                ep_stats['stats'][f'{col}/count'] = [num_frames]
+            ep_stats['stats']['timestamp/min'] = [float(timestamps.min())]
+            ep_stats['stats']['timestamp/max'] = [float(timestamps.max())]
+            ep_stats['stats']['timestamp/mean'] = [float(timestamps.mean())]
+            ep_stats['stats']['timestamp/std'] = [float(timestamps.std())]
+            ep_stats['stats']['timestamp/count'] = [num_frames]
+            episodes_stats_list.append(ep_stats)
+
+            # E2. Episode summary (for episodes.jsonl + episodes.parquet)
             episode_dict = {
                 'episode_index': episode_idx,
-                'tasks': TASK_INSTRUCTIONS,  
+                'tasks': TASK_INSTRUCTIONS,
                 'length': num_frames,
-                'dataset_from_index': global_frame_counter,
-                'dataset_to_index': global_frame_counter + num_frames - 1,
+                'dataset_index': 0,
                 'data/chunk_index': 0,
                 'data/file_index': episode_idx,
                 'meta/episodes/chunk_index': 0,
@@ -299,8 +317,8 @@ def process_dataset():
     # 5. 写入各个核心元数据文件
     # =========================================================================
     print("\n⏳ 正在计算并生成最终数据集元数据...")
-    
-    # 5.1 生成 Stats statistics (stats.json)
+
+    # 5.1 生成全局统计 (stats.json)
     final_stats = {}
     for key, s in stats_accum.items():
         if s['count'] > 0:
@@ -326,16 +344,61 @@ def process_dataset():
     with open(meta_dir / 'stats.json', 'w') as f:
         json.dump(final_stats, f, indent=4)
 
-    # 5.2 生成 episodes.parquet
-    pd.DataFrame(episodes_metadata).to_parquet(episodes_dir / 'file-000.parquet', engine='pyarrow')
+    # 5.2 生成 episodes.jsonl（每集一条，含完整 stats）
+    with open(meta_dir / 'episodes.jsonl', 'w', encoding='utf-8') as f:
+        for ep in episodes_metadata:
+            json_line = {
+                'episode_index': ep['episode_index'],
+                'tasks': ep['tasks'],
+                'length': ep['length'],
+                'dataset_index': ep['dataset_index'],
+            }
+            f.write(json.dumps(json_line, ensure_ascii=False) + '\n')
 
-    # 5.3 生成跨任务语言映射文件 (tasks.parquet)
-    tasks_records = [{'instruction': inst, 'task_index': DEFAULT_TASK_INDEX} for inst in TASK_INSTRUCTIONS]
-    df_new_tasks = pd.DataFrame(tasks_records)
-    df_new_tasks.set_index('instruction', inplace=True)
-    df_new_tasks.to_parquet(meta_dir / 'tasks.parquet', engine='pyarrow')
+    # 5.2b 生成 episodes_stats.jsonl（LeRobot 3.0+ 必需）
+    with open(meta_dir / 'episodes_stats.jsonl', 'w', encoding='utf-8') as f:
+        for ep_stat in episodes_stats_list:
+            f.write(json.dumps(ep_stat, ensure_ascii=False) + '\n')
 
-    # 5.4 生成 info.json
+    # 5.3 生成 episodes.parquet（33列完整 schema）
+    df_episodes = pd.DataFrame(episodes_metadata)
+    col_order = [
+        'episode_index', 'tasks', 'length', 'dataset_index',
+        'data/chunk_index', 'data/file_index',
+        'meta/episodes/chunk_index', 'meta/episodes/file_index',
+        'videos/observation.images.cam_high/chunk_index',
+        'videos/observation.images.cam_high/file_index',
+        'videos/observation.images.cam_high/from_timestamp',
+        'videos/observation.images.cam_high/to_timestamp',
+        'stats/observation.state/min', 'stats/observation.state/max',
+        'stats/observation.state/mean', 'stats/observation.state/std', 'stats/observation.state/count',
+        'stats/observation.effort/min', 'stats/observation.effort/max',
+        'stats/observation.effort/mean', 'stats/observation.effort/std', 'stats/observation.effort/count',
+        'stats/action/min', 'stats/action/max',
+        'stats/action/mean', 'stats/action/std', 'stats/action/count',
+        'stats/timestamp/min', 'stats/timestamp/max',
+        'stats/timestamp/mean', 'stats/timestamp/std', 'stats/timestamp/count',
+    ]
+    df_episodes = df_episodes[[c for c in col_order if c in df_episodes.columns]]
+    df_episodes.to_parquet(episodes_dir / 'file-000.parquet', engine='pyarrow')
+
+    # 5.4 生成 tasks.jsonl（每条任务一行）
+    with open(meta_dir / 'tasks.jsonl', 'w', encoding='utf-8') as f:
+        for idx, inst in enumerate(TASK_INSTRUCTIONS):
+            f.write(json.dumps({'task_index': DEFAULT_TASK_INDEX, 'task': inst}, ensure_ascii=False) + '\n')
+
+    # 5.4b 生成 tasks.parquet（LeRobot 3.0+ 必需）
+    tasks_data = {
+        'task_index': [DEFAULT_TASK_INDEX] * len(TASK_INSTRUCTIONS),
+        'instruction': TASK_INSTRUCTIONS,
+    }
+    tasks_schema = pa.schema([
+        pa.field('task_index', pa.int64()),
+        pa.field('instruction', pa.large_string()),
+    ])
+    pq.write_table(pa.Table.from_pydict(tasks_data, schema=tasks_schema), str(meta_dir / 'tasks.parquet'))
+
+    # 5.5 生成 info.json
     motor_names = [
         "right_joint_0", "right_joint_1", "right_joint_2", "right_joint_3",
         "right_joint_4", "right_joint_5", "right_joint_6", "right_dexterous_hand"
@@ -345,7 +408,7 @@ def process_dataset():
         "robot_type": "aloha",
         "total_episodes": total_episodes,
         "total_frames": total_frames,
-        "total_tasks": 1, 
+        "total_tasks": 1,
         "fps": FPS,
         "chunks_size": CHUNK_SIZE,
         "splits": {"train": f"0:{total_episodes}"},
@@ -360,7 +423,8 @@ def process_dataset():
             "timestamp": {"dtype": "float32", "shape": [1], "names": None, "fps": FPS},
             "next.done": {"dtype": "bool", "shape": [1], "names": None, "fps": FPS},
             "index": {"dtype": "int64", "shape": [1], "names": None, "fps": FPS},
-            "task_index": {"dtype": "int64", "shape": [1], "names": None, "fps": FPS}
+            "task_index": {"dtype": "int64", "shape": [1], "names": None, "fps": FPS},
+            "instruction": {"dtype": "string", "shape": [1], "names": None, "fps": FPS},
         }
     }
     for key, name in cam_keys.items():

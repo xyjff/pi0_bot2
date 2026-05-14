@@ -1,6 +1,18 @@
 #!/usr/bin/env python3
 """Offline training launcher for pi0_right_arm_head_cam."""
 
+"""
+cd /share/0xyj/model3_openpi0.5/my_pi0_training && /share/0xyj/model3_openpi0.5/openpi-main/.venv/bin/python train_right_arm_head_cam.py pi0_right_arm_head_cam --exp-name train_125_jiazhuastate_true 2>&1 | tee train.log &
+echo "PID: $!"
+  
+  
+可以用 tail -f train.log 监控进度
+  
+  """
+  
+  
+  
+  
 import json
 import os
 import pathlib

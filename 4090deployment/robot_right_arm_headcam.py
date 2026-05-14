@@ -22,8 +22,11 @@
 使用方式：
 cd /home/dmh/xyj_zhipingfang/model3_openpi0.5/my_bot2_deployment/4090deployment
 /home/dmh/xyj_zhipingfang/model3_openpi0.5/openpi-main/.venv/bin/python robot_right_arm_headcam.py \
-  --checkpoint-dir /home/dmh/xyj_zhipingfang/model3_openpi0.5/checkpoints/pi0_checkpoint_xin128tiao_headcam/28000 \
+  --checkpoint-dir /home/dmh/xyj_zhipingfang/model3_openpi0.5/checkpoints/pi0_checkpoint_xin125tiao_headcam_jaizhuaguiyihua/10000 \
   --listen-port 9000
+
+
+
 
 键盘操作：
     按 Enter/回车: 启动连续推理并持续下发动作给机器人端
